@@ -1,0 +1,16 @@
+[Unit]
+Description=PreYes Consensus Lock Weather Bot (Paper Simulation)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/weatherbotPreYes0910
+ExecStart=/bin/bash /root/weatherbotPreYes0910/run_paper.sh
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

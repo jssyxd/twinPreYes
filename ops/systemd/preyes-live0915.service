@@ -1,0 +1,16 @@
+[Unit]
+Description=PreYes Consensus Lock Weather Bot (Live Real Trading)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/weatherbotLive0915
+ExecStart=/bin/bash /root/weatherbotLive0915/run_live.sh
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

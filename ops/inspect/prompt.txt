@@ -1,0 +1,1 @@
+[自动巡检-30min] 变更={{CHANGED}} 哈希={{HASH}}。请读取 C:\Users\da\my155-inspect\last_report.txt:变更=True 时按模板汇报(①实盘现金/持仓/权益/PnL/新成交与拒单 ②模拟盘同项 ③异常与建议);变更=False 时只回一行『无变化』并附关键数字(实盘现金/权益、模拟盘 TOTAL)。若文件为空或 SSH 失败,请报告错误原因。

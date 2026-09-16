@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily restart for preyes-live0915 to refresh UTC phrase
+After=network.target
+
+[Timer]
+OnCalendar=*-*-* 00:01:00 UTC
+Persistent=true
+Unit=preyes-live0915.service
+
+[Install]
+WantedBy=timers.target
