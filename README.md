@@ -54,6 +54,14 @@ The system runs two completely isolated execution tracks side-by-side on the sam
 
 ---
 
+
+### L2 CLOB API Credentials & Auto-Derivation Resilience
+Polymarket CLOB v2 requires Level-2 API credentials (: API Key, Secret, Passphrase) to authenticate authenticated REST endpoints (such as  balance checks and order cancellations). 
+
+To ensure **zero downtime across restarts, reboots, and migrations**, the engine implements a two-tier credential strategy:
+1. **Explicit Credentials (Fast Path)**: Read directly from  (, , ).
+2. **Deterministic Auto-Derivation (Self-Healing Fallback)**: If the L2 API trio is omitted or lost during reboots,  automatically calls  to deterministically derive the credentials from the L1  on startup, setting them via . This completely prevents  and preflight lockouts.
+
 ## Three-Gate Live Safety Lock
 
 To prevent errant executions or unauthorized restarts, the Live trading engine requires three distinct gates to be satisfied simultaneously before any real order can be signed:

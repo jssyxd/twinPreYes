@@ -145,13 +145,21 @@ def sdk_available() -> bool:
 
 
 def build_client(creds: dict, *, host: str = CLOB_HOST, chain_id: int = CHAIN_ID) -> Any:
-    """Construct a Level-2 v2 client (explicit ApiCreds; no cred derivation in v2)."""
+    """Construct a Level-2 v2 client. Auto-derives ApiCreds from L1 private key if not explicitly provided."""
     lib = _py_clob_v2()
     api_creds = None
     if creds.get("api_key") and creds.get("api_secret") and creds.get("api_passphrase"):
         api_creds = lib["ApiCreds"](creds["api_key"], creds["api_secret"], creds["api_passphrase"])
-    return lib["ClobClient"](host, chain_id=chain_id, key=creds["private_key"], creds=api_creds,
+    client = lib["ClobClient"](host, chain_id=chain_id, key=creds["private_key"], creds=api_creds,
                              signature_type=creds["signature_type"], funder=creds["funder_address"])
+    if api_creds is None:
+        try:
+            derived = client.derive_api_key()
+            if derived is not None:
+                client.set_api_creds(derived)
+        except Exception:
+            pass
+    return client
 
 
 def server_version(client) -> int | None:
