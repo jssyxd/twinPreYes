@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument("--initial-capital", type=float, default=200.0, help="Paper initial capital (default: 200.0 USDC)")
     parser.add_argument("--budget", type=float, default=20.0, help="Per-basket budget in USDC (default: 20.0 USDC)")
     parser.add_argument("--interval", type=int, default=20, help="Scan interval in seconds (default: 20s)")
-    parser.add_argument("--min-profit-pct", type=float, default=5.0, help="Min arb net profit % hurdle (default: 5.0%)")
+    parser.add_argument("--min-profit-pct", type=float, default=5.0, help="Min arb net profit pct hurdle (default: 5.0 pct)")
     parser.add_argument("--target-spread", type=float, default=0.04, help="Target maker spread in cents (default: 0.04)")
     parser.add_argument("--events-limit", type=int, default=30, help="Number of Gamma events to scan (default: 30)")
     parser.add_argument("--max-skew-ms", type=float, default=300.0, help="Max latency skew across books (default: 300ms)")

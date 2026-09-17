@@ -88,6 +88,7 @@ class ConsensusTracker:
         self.window_seconds = int(window_seconds)
         self.min_samples = int(min_samples)
         self._series: dict[str, dict[str, BucketSeries]] = defaultdict(dict)
+        self.running_extremes: dict[str, dict[str, float]] = {}
 
     def session_key(self, city_id: str, market_local_date: str, direction: str) -> str:
         return f"{city_id}|{market_local_date}|{direction}"
