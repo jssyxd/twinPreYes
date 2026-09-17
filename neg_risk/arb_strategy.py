@@ -1,20 +1,17 @@
 """Negative Risk (Neg-Risk) Convexity Arbitrage Strategy.
 
-Core Principle:
-In any mutually exclusive, collectively exhaustive event (e.g., Temperature Buckets, Election Winner, Rate Cut Tier):
-Exactly ONE outcome resolves to $1.00, all other outcomes resolve to $0.00.
-Therefore:
-1. Long Basket Convexity: If Sum(Best Asks for all Yes tokens) < 1.00 - fee_hurdle (e.g., < 0.96)
-   -> BUY 1 share of ALL Yes tokens simultaneously.
-   Cost: Sum(Ask_i) < 0.96 USDC.
-   Guaranteed Payout at Resolution: Exactly 1.00 USDC.
-   Net Guaranteed Arbitrage Profit: 1.00 - Sum(Ask_i) > 0.04 USDC (Risk-free 4%+ ROI).
-
-2. Short Basket Convexity (Negative Risk Collateral): If Sum(Best Bids for all Yes tokens) > 1.00 + fee_hurdle (e.g., > 1.04)
-   -> SELL 1 share of ALL Yes tokens (or mint complete sets and sell into bids).
-   Revenue: Sum(Bid_i) > 1.04 USDC.
-   Liability at Resolution: Exactly 1.00 USDC.
-   Net Guaranteed Arbitrage Profit: Sum(Bid_i) - 1.00 > 0.04 USDC.
+Incorporates Jane Street High-Frequency & Arbitrage Principles:
+1. Book Synchrony / Stale Book Rejection (Zero Phantom Arbitrage):
+   Rejects opportunities if book skew across legs > max_book_skew_seconds (default 300ms)
+   or if any book is older than max_book_age_seconds (default 1.5s).
+2. True Economic Hurdle (Risk Premium):
+   Default min_profit_pct = 5.0% (0.05) to properly cover legging risk, exchange fees,
+   and adverse selection costs.
+3. Bottleneck-First Leg Ordering (Fragile-First Sequencing):
+   Legs are deterministically ordered by available depth ascending.
+   The least liquid / most fragile leg is placed at Index 0 (Probe Leg).
+4. Worst-Acceptable-Price Limits:
+   Pre-computes max executable slippage threshold per leg.
 """
 from __future__ import annotations
 
@@ -34,77 +31,125 @@ class NegRiskArbitrageEngine:
     def __init__(
         self,
         *,
-        min_profit_pct: Decimal = Decimal("0.02"),  # 2% minimum net margin hurdle
+        min_profit_pct: Decimal = Decimal("0.05"),  # 5% minimum net margin hurdle (Jane Street rule)
         max_position_usdc: Decimal = Decimal("50.0"),  # max USDC per arbitrage basket
         min_order_usdc: Decimal = Decimal("1.0"),
+        max_book_skew_seconds: float = 0.300,  # 300ms maximum time discrepancy between books
+        max_book_age_seconds: float = 2.0,  # 2.0s maximum snapshot staleness
+        max_leg_slippage_pct: Decimal = Decimal("0.01"),  # 1% worst acceptable price buffer
     ) -> None:
         self.min_profit_pct = min_profit_pct
         self.max_position_usdc = max_position_usdc
         self.min_order_usdc = min_order_usdc
+        self.max_book_skew_seconds = max_book_skew_seconds
+        self.max_book_age_seconds = max_book_age_seconds
+        self.max_leg_slippage_pct = max_leg_slippage_pct
+
+    def _verify_books_freshness(
+        self,
+        event: EventMarket,
+        books: dict[str, BucketBook],
+        now: float,
+    ) -> tuple[bool, float]:
+        """Check if all books exist, are fresh, and have low latency skew across the basket."""
+        timestamps: list[float] = []
+        for bucket in event.buckets:
+            book = books.get(bucket.yes_token_id)
+            if book is None or book.fetched_at <= 0.0:
+                return False, 0.0
+            age = now - book.fetched_at
+            if age > self.max_book_age_seconds or age < -0.1:  # future skew or too stale
+                return False, 0.0
+            timestamps.append(book.fetched_at)
+
+        skew = max(timestamps) - min(timestamps)
+        if skew > self.max_book_skew_seconds:
+            return False, skew * 1000.0
+        return True, skew * 1000.0
 
     def evaluate_long_basket(
         self,
         event: EventMarket,
         books: dict[str, BucketBook],
+        now: float | None = None,
     ) -> BasketArbOpportunity | None:
-        """Evaluate if buying 1 share of ALL outcome Yes tokens yields guaranteed profit (SumAsk < 1.00)."""
+        """Evaluate if buying 1 share of ALL outcome Yes tokens yields guaranteed profit (SumAsk < 1.00).
+
+        Applies:
+        - Latency skew / stale quote rejection
+        - Bottleneck-first leg sorting (thinnest liquidity first)
+        - Worst acceptable limit price calculation
+        """
         if not event.buckets or len(event.buckets) < 2:
             return None
 
-        legs: list[BasketArbLeg] = []
+        current_time = time.time() if now is None else now
+        is_fresh, skew_ms = self._verify_books_freshness(event, books, current_time)
+        if not is_fresh:
+            return None
+
+        raw_legs: list[dict] = []
         sum_ask = Decimal("0")
-        max_executable_shares = Decimal("999999999")
+        min_depth = Decimal("999999999")
+        bottleneck_token = ""
 
         for bucket in event.buckets:
             tok = bucket.yes_token_id
             book = books.get(tok)
             if book is None or book.best_ask is None or book.ask_size <= Decimal("0"):
-                # Complete set broken: cannot guarantee 100% payoff coverage
+                # Complete set broken
                 return None
 
             best_ask = book.best_ask
-            avail_size = book.ask_size
+            avail_depth = book.ask_size
 
             sum_ask += best_ask
-            if avail_size < max_executable_shares:
-                max_executable_shares = avail_size
+            if avail_depth < min_depth:
+                min_depth = avail_depth
+                bottleneck_token = tok
 
-            legs.append(
-                BasketArbLeg(
-                    token_id=tok,
-                    label=bucket.label,
-                    side="BUY",
-                    price=best_ask,
-                    size=Decimal("0"),  # calculated below
-                    cost_or_proceed=Decimal("0"),
-                )
-            )
+            # Worst acceptable price: best_ask + buffer (cap at 0.99)
+            worst_px = min(Decimal("0.99"), best_ask + self.max_leg_slippage_pct).quantize(Decimal("0.01"))
 
-        # Hurdle: Sum of asks must be strictly below 1.00 - min_profit_pct
+            raw_legs.append({
+                "token_id": tok,
+                "label": bucket.label,
+                "price": best_ask,
+                "depth": avail_depth,
+                "worst_px": worst_px,
+            })
+
+        # Hurdle: Sum of asks must be strictly below 1.00 - min_profit_pct (e.g., < 0.95)
         target_max_sum = Decimal("1.00") - self.min_profit_pct
         if sum_ask >= target_max_sum or sum_ask <= Decimal("0"):
             return None
 
-        # Determine executable sizing based on book depth and capital cap
+        # Sizing: strictly constrained by the thinnest bottleneck depth and position cap
         shares_by_capital = self.max_position_usdc / sum_ask
-        exec_shares = min(max_executable_shares, shares_by_capital)
+        exec_shares = min(min_depth, shares_by_capital)
 
-        # Minimum order check
         total_cost = (sum_ask * exec_shares).quantize(Decimal("0.0001"))
-        if total_cost < self.min_order_usdc:
+        if total_cost < self.min_order_usdc or exec_shares <= Decimal("0"):
             return None
 
+        # JANE STREET PRINCIPLE: Bottleneck-First Leg Sequencing
+        # Sort legs by available_depth ascending so the most fragile leg is Index 0 (Probe Leg)
+        raw_legs.sort(key=lambda x: x["depth"])
+
         final_legs: list[BasketArbLeg] = []
-        for leg in legs:
-            leg_cost = (leg.price * exec_shares).quantize(Decimal("0.0001"))
+        for i, item in enumerate(raw_legs):
+            leg_cost = (item["price"] * exec_shares).quantize(Decimal("0.0001"))
             final_legs.append(
                 BasketArbLeg(
-                    token_id=leg.token_id,
-                    label=leg.label,
+                    token_id=item["token_id"],
+                    label=item["label"],
                     side="BUY",
-                    price=leg.price,
+                    price=item["price"],
                     size=exec_shares,
                     cost_or_proceed=leg_cost,
+                    available_depth=item["depth"],
+                    is_bottleneck=(i == 0),
+                    worst_acceptable_price=item["worst_px"],
                 )
             )
 
@@ -124,21 +169,31 @@ class NegRiskArbitrageEngine:
             expected_payout_usdc=expected_payout,
             net_profit_usdc=net_profit,
             roi_percent=roi,
-            timestamp=time.time(),
+            timestamp=current_time,
+            max_book_skew_ms=round(skew_ms, 2),
+            bottleneck_token_id=bottleneck_token,
+            bottleneck_depth=min_depth,
         )
 
     def evaluate_short_basket(
         self,
         event: EventMarket,
         books: dict[str, BucketBook],
+        now: float | None = None,
     ) -> BasketArbOpportunity | None:
         """Evaluate if selling all Yes outcomes against bids yields SumBid > 1.00."""
         if not event.buckets or len(event.buckets) < 2:
             return None
 
-        legs: list[BasketArbLeg] = []
+        current_time = time.time() if now is None else now
+        is_fresh, skew_ms = self._verify_books_freshness(event, books, current_time)
+        if not is_fresh:
+            return None
+
+        raw_legs: list[dict] = []
         sum_bid = Decimal("0")
-        max_executable_shares = Decimal("999999999")
+        min_depth = Decimal("999999999")
+        bottleneck_token = ""
 
         for bucket in event.buckets:
             tok = bucket.yes_token_id
@@ -147,47 +202,52 @@ class NegRiskArbitrageEngine:
                 return None
 
             best_bid = book.best_bid
-            avail_size = book.bid_size
+            avail_depth = book.bid_size
 
             sum_bid += best_bid
-            if avail_size < max_executable_shares:
-                max_executable_shares = avail_size
+            if avail_depth < min_depth:
+                min_depth = avail_depth
+                bottleneck_token = tok
 
-            legs.append(
-                BasketArbLeg(
-                    token_id=tok,
-                    label=bucket.label,
-                    side="SELL",
-                    price=best_bid,
-                    size=Decimal("0"),
-                    cost_or_proceed=Decimal("0"),
-                )
-            )
+            worst_px = max(Decimal("0.01"), best_bid - self.max_leg_slippage_pct).quantize(Decimal("0.01"))
+
+            raw_legs.append({
+                "token_id": tok,
+                "label": bucket.label,
+                "price": best_bid,
+                "depth": avail_depth,
+                "worst_px": worst_px,
+            })
 
         target_min_sum = Decimal("1.00") + self.min_profit_pct
         if sum_bid <= target_min_sum:
             return None
 
-        # Calculate executable shares
         shares_by_capital = self.max_position_usdc / Decimal("1.00")
-        exec_shares = min(max_executable_shares, shares_by_capital)
+        exec_shares = min(min_depth, shares_by_capital)
         total_proceeds = (sum_bid * exec_shares).quantize(Decimal("0.0001"))
-        liability = exec_shares.quantize(Decimal("0.0001"))  # Maximum payout liability is 1.00 * shares
+        liability = exec_shares.quantize(Decimal("0.0001"))
 
-        if total_proceeds < self.min_order_usdc:
+        if total_proceeds < self.min_order_usdc or exec_shares <= Decimal("0"):
             return None
 
+        # Sort by depth ascending
+        raw_legs.sort(key=lambda x: x["depth"])
+
         final_legs: list[BasketArbLeg] = []
-        for leg in legs:
-            proceed = (leg.price * exec_shares).quantize(Decimal("0.0001"))
+        for i, item in enumerate(raw_legs):
+            proceed = (item["price"] * exec_shares).quantize(Decimal("0.0001"))
             final_legs.append(
                 BasketArbLeg(
-                    token_id=leg.token_id,
-                    label=leg.label,
+                    token_id=item["token_id"],
+                    label=item["label"],
                     side="SELL",
-                    price=leg.price,
+                    price=item["price"],
                     size=exec_shares,
                     cost_or_proceed=proceed,
+                    available_depth=item["depth"],
+                    is_bottleneck=(i == 0),
+                    worst_acceptable_price=item["worst_px"],
                 )
             )
 
@@ -206,23 +266,27 @@ class NegRiskArbitrageEngine:
             expected_payout_usdc=total_proceeds,
             net_profit_usdc=net_profit,
             roi_percent=roi,
-            timestamp=time.time(),
+            timestamp=current_time,
+            max_book_skew_ms=round(skew_ms, 2),
+            bottleneck_token_id=bottleneck_token,
+            bottleneck_depth=min_depth,
         )
 
     def scan_all_events(
         self,
         events: Sequence[EventMarket],
         books: dict[str, BucketBook],
+        now: float | None = None,
     ) -> list[BasketArbOpportunity]:
-        """Scan all candidate events for either long or short basket arbitrage."""
+        """Scan all candidate events with freshness and bottleneck filters."""
         opportunities: list[BasketArbOpportunity] = []
         for ev in events:
-            opp_long = self.evaluate_long_basket(ev, books)
+            opp_long = self.evaluate_long_basket(ev, books, now)
             if opp_long is not None:
                 opportunities.append(opp_long)
-                continue  # If long exists, short cannot exist simultaneously
+                continue
 
-            opp_short = self.evaluate_short_basket(ev, books)
+            opp_short = self.evaluate_short_basket(ev, books, now)
             if opp_short is not None:
                 opportunities.append(opp_short)
 

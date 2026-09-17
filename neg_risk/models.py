@@ -1,9 +1,21 @@
-"""Data models for Polymarket Negative Risk (Neg-Risk) Basket Arbitrage and Market Making."""
+"""Data models for Polymarket Negative Risk (Neg-Risk) Basket Arbitrage and Market Making.
+Includes Jane Street-grade latency-skew, bottleneck-first, and auto-unwind state models.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Literal
+
+
+class LegStatus(str, Enum):
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    UNWOUND = "UNWOUND"
 
 
 @dataclass(frozen=True)
@@ -25,7 +37,7 @@ class EventMarket:
     title: str
     buckets: tuple[OutcomeBucket, ...]
     neg_risk: bool = True
-    category: str = "temperature"  # temperature, politics, fed_rates, crypto_range
+    category: str = "temperature"
     resolution_date: str | None = None
 
 
@@ -62,6 +74,9 @@ class BasketArbLeg:
     price: Decimal
     size: Decimal
     cost_or_proceed: Decimal
+    available_depth: Decimal = Decimal("0")
+    is_bottleneck: bool = False
+    worst_acceptable_price: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -70,7 +85,7 @@ class BasketArbOpportunity:
     event_id: str
     event_slug: str
     title: str
-    legs: tuple[BasketArbLeg, ...]
+    legs: tuple[BasketArbLeg, ...]  # Ordered Bottleneck-First (thinnest liquidity first)
     sum_price: Decimal
     executable_shares: Decimal
     total_cost_usdc: Decimal
@@ -78,6 +93,42 @@ class BasketArbOpportunity:
     net_profit_usdc: Decimal
     roi_percent: Decimal
     timestamp: float
+    max_book_skew_ms: float = 0.0
+    bottleneck_token_id: str = ""
+    bottleneck_depth: Decimal = Decimal("0")
+
+
+@dataclass
+class LegExecutionRecord:
+    token_id: str
+    label: str
+    side: Literal["BUY", "SELL"]
+    target_price: Decimal
+    target_size: Decimal
+    executed_price: Decimal = Decimal("0")
+    executed_size: Decimal = Decimal("0")
+    status: LegStatus = LegStatus.PENDING
+    order_id: str | None = None
+    error_message: str | None = None
+    submit_timestamp: float = 0.0
+    filled_timestamp: float = 0.0
+
+
+@dataclass
+class BasketExecutionReport:
+    plan_id: str
+    event_slug: str
+    arb_type: str
+    status: Literal["ALL_FILLED", "UNWOUND", "PROBE_ABORTED", "FAILED"]
+    legs_total: int
+    legs_filled: int
+    legs_unwound: int
+    total_spent_usdc: Decimal
+    total_recovered_usdc: Decimal
+    net_pnl_usdc: Decimal
+    legs: list[LegExecutionRecord] = field(default_factory=list)
+    unwind_notes: str = ""
+    duration_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -103,4 +154,4 @@ class MakerPlan:
     sum_ask: Decimal
     maker_spread: Decimal
     timestamp: float
-    is_structurally_safe: bool  # True if sum_bid < 1.00 and sum_ask > 1.00
+    is_structurally_safe: bool

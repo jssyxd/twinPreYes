@@ -15,6 +15,13 @@
     "max_open_positions": 22,
     "settle_grace_hours": 2,
     "contract_cities_path": "config/contract_cities.json",
+    "active_icaos": [
+        "EGLC",
+        "EDDM",
+        "EHAM",
+        "EFHK",
+        "KATL"
+    ],
     "state_path": "data/yes2re_state.json",
     "log_path": "data/yes2re_events.jsonl",
     "health_path": "data/yes2re_health.json",
