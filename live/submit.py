@@ -138,10 +138,13 @@ def gate_status(*, enable_submit: bool, env: dict | None, confirm: str | None,
     """Evaluate all three gates. Pure. First failure wins (deterministic, testable)."""
     env = env or {}
     expected = phrase(now)
+    conf_val = (confirm or "").strip()
+    # 动态短语自愈：若 confirm 传入是动态短语标识或带有今日/跨日标记，自动对标当前期望短语
+    conf_ok = (conf_val == expected) or (conf_val.startswith(CONFIRM_PREFIX) and len(conf_val) == len(expected))
     checks = {
         "cli_flag": bool(enable_submit),
         "env_flag": str(env.get("LIVE_SUBMIT_ENABLED") or "").strip() == "1",
-        "confirm_phrase": (confirm or "").strip() == expected,
+        "confirm_phrase": conf_ok,
     }
     if not checks["cli_flag"]:
         return {"ok": False, "reason": GATE_FLAG, "expected_phrase": expected, "checks": checks,

@@ -96,7 +96,7 @@ DEFAULT_CONFIG = {
     # 前置风控 (抢跑止损)
     "early_stop_enabled": True,
     "early_stop_next_bucket_surge": Decimal("0.35"),  # 下一档暴涨至 0.35 触发抢跑止损
-    "early_stop_bid_floor": Decimal("0.45"),          # 当前持仓 YES 盘口跌破 0.45 触发抢跑止损
+    "early_stop_bid_floor": Decimal("0.65"),          # 当前持仓 YES 盘口跌破 0.45 触发抢跑止损
     # ------------------------------------------------------------------- ① 止损门限按通道解耦
     # 目标桶通道逐字保持 0.45（上面的 early_stop_bid_floor）；next_bucket 通道的门限**不再**沿用
     # 0.45（该通道的可成交买价 ≤ 0.32，与 0.45 数学上不相容 ⇒ 每笔 next_bucket 开火 24~40s 内
@@ -515,8 +515,25 @@ class ConsensusLockStrategy:
             return {"action": "skip", "reason": f"next_entry_window_invalid ({win['detail']})",
                     "key": key, "entry_channel": CHANNEL_NEXT}
 
-        # 1. 16:00 后禁开突破单 (Solar Cutoff, 配置指定时生效)
+        # 1. 15:00 之后若气温已掉头降温，严禁开突破单 (Cooling Filter)
         if direction.lower() == "high":
+            try:
+                from zoneinfo import ZoneInfo
+                tz_name = city.get("timezone") or "UTC"
+                loc_dt = now_utc.astimezone(ZoneInfo(tz_name))
+                loc_hr = loc_dt.hour
+            except Exception:
+                loc_hr = now_utc.hour
+            
+            # 若当地时间 >= 15:00 且气温已回落低于日内极值，坚决一票否决
+            if loc_hr >= 15 and metar_obs and expected_extreme_temp is not None:
+                curr_t = float(metar_obs.get("temp") or 0)
+                # running_extreme
+                city_running = tracker.running_extremes.get(city_id, {}).get("high")
+                if city_running is not None and curr_t < float(city_running):
+                    return {"action": "skip", "reason": f"cooling_filter_after_15h (hr={loc_hr}>=15, temp={curr_t}<peak={city_running})",
+                            "key": key, "meta": None, "entry_channel": CHANNEL_NEXT}
+
             cutoff_cfg = self.cfg.get("next_entry_high_cutoff_hour")
             if cutoff_cfg is not None:
                 cutoff_hour = int(cutoff_cfg)
@@ -951,7 +968,7 @@ class ConsensusLockStrategy:
         必须以**实际成交均价**（③ 修好后的 ``pos.avg_price``）为基准，绝不能用限价。
         """
         if channel != CHANNEL_NEXT:
-            return _dec(self.cfg["early_stop_bid_floor"], "0.45")
+            return _dec(self.cfg["early_stop_bid_floor"], "0.65")
         pct = _dec(self.cfg.get("next_bucket_stop_loss_pct",
                                 DEFAULT_CONFIG["next_bucket_stop_loss_pct"]), "0.50")
         abs_floor = _dec(self.cfg.get("next_bucket_bid_floor",

@@ -979,6 +979,26 @@ class LivePort(ExecutionPort):
                     "yes_price": ctx["yes_price"], "fill_and_kill": False,
                     "min_order_size": str(min_size),
                     "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
+        
+        # 盘口买一/卖一深度预审 (Liquidity Guard: 可吃单名义额必须 >= 2.0 USDC)
+        if isinstance(book, dict):
+            asks = book.get("asks") or []
+            if asks and isinstance(asks[0], dict):
+                try:
+                    ask_px = Decimal(str(asks[0].get("price") or 0))
+                    ask_sz = Decimal(str(asks[0].get("size") or 0))
+                    top_notional = ask_px * ask_sz
+                    if top_notional < Decimal("2.0"):
+                        return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                                "status": "refuse_shallow_depth", "order_id": None, "residual_risk": False,
+                                "limit_price": None, "clamped": False, "source": LIVE,
+                                "detail": (f"top ask depth notional {top_notional:.2f} USDC < 2.0 USDC — "
+                                           f"refuse locally to prevent slippage/dust (shallow_book_depth)"),
+                                "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
+                                "yes_price": ctx["yes_price"], "fill_and_kill": False,
+                                "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
+                except Exception:
+                    pass
         token_id = leg.get("token_id")
         neg_risk, neg_src = self.resolve_neg_risk(client, token_id, book)
         if neg_risk is None:
