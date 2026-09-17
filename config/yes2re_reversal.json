@@ -23,7 +23,7 @@
         "high_local_start": 12.5,
         "high_local_end": 18,
         "low_local_start": 0,
-        "low_local_end": 9,
+        "low_local_end": 10.0,
         "next_bucket_max_twap": "0.26",
         "next_bucket_twap_window_s": 3600,
         "next_bucket_max_instant_ask": "0.30",
@@ -58,7 +58,9 @@
         "weather_abortion_temp_drop": 2.5,
         "weather_abortion_cutoff_hour": 15,
         "next_entry_cooling_filter": true,
-        "min_take_notional_usdc": "2.0"
+        "min_take_notional_usdc": "2.0",
+        "low_next_bucket_max_twap": "0.35",
+        "low_min_dwell_seconds": 900
     },
     "strategy": {
         "arm_c": 1.0,
@@ -79,7 +81,7 @@
         "high_fire_local_start": 12,
         "high_fire_local_hour_end": 18,
         "low_fire_local_start": 0,
-        "low_fire_local_end": 9,
+        "low_fire_local_end": 10.0,
         "fast_poll_seconds": 8,
         "fire_budget_ms": 8000,
         "max_obs_lookback_seconds": 5400,

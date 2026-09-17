@@ -430,7 +430,11 @@ class ConsensusLockStrategy:
             meta["next_bucket_id"] = next_id
             meta["next_bucket_twap"] = str(next_twap) if next_twap is not None else "none"
 
-            max_allowed = _dec(self.cfg["next_bucket_max_twap"], "0.26")
+            # 针对清晨 Low 最低温市场放宽 TWAP 门槛（夜间点差偏大），High 仍严格保持 0.26
+            if direction.lower() == "low":
+                max_allowed = _dec(self.cfg.get("low_next_bucket_max_twap", "0.35"), "0.35")
+            else:
+                max_allowed = _dec(self.cfg.get("next_bucket_max_twap", "0.26"), "0.26")
             # 价格子门：``price_gates=False``（并行通道）时只留读数作为证据，不拦截。
             if price_gates and next_twap is not None and next_twap >= max_allowed:
                 return False, f"next_bucket_twap_too_high ({next_twap} >= {max_allowed})", meta
@@ -765,6 +769,7 @@ class ConsensusLockStrategy:
 
         dir_norm = direction.lower()
         min_dwell_s = float(self.cfg.get("min_dwell_seconds_if_rising", 1800))
+        min_dwell_low_s = float(self.cfg.get("low_min_dwell_seconds", 900))
         if len(hist) >= 2:
             prev_temp = hist[-2]["temp"]
             dwell_s = now_ts - hist[-1]["recorded_at"]
@@ -776,10 +781,10 @@ class ConsensusLockStrategy:
                         "key": key,
                     }
             else:
-                if curr_temp < prev_temp and dwell_s < min_dwell_s:
+                if curr_temp < prev_temp and dwell_s < min_dwell_low_s:
                     return {
                         "action": "skip",
-                        "reason": f"temperature_falling_velocity_active (dropped {prev_temp}C -> {curr_temp}C, dwell {int(dwell_s)}s < {int(min_dwell_s)}s)",
+                        "reason": f"temperature_falling_velocity_active (dropped {prev_temp}C -> {curr_temp}C, dwell {int(dwell_s)}s < {int(min_dwell_low_s)}s)",
                         "key": key,
                     }
 
