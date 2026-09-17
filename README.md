@@ -173,6 +173,30 @@ Set up a 30-minute cron check to log dual-track metrics:
 
 ---
 
+## Neg-Risk Convexity Arbitrage & Market Making (Maker Track)
+
+A mathematical pivot from directional Taker betting to structural Maker liquidity provision and cross-outcome convexity arbitrage on Polymarket Negative Risk (Neg-Risk) multi-outcome markets.
+
+### Core Principles
+1. **Mutually Exclusive & Collectively Exhaustive**: In any multi-outcome event (Election Winner, Temperature Buckets, Federal Reserve Rate Decisions, Crypto Range), exactly ONE outcome resolves to $1.00 and all others resolve to $0.00.
+2. **Long Basket Convexity Arbitrage**:
+   $$\sum_{i=1}^N \text{Ask}_i < 1.00 - \text{fee}$$
+   Simultaneously buying 1 share of all outcomes guarantees a $1.00 payout at resolution with zero directional risk.
+3. **Two-Sided Market Maker Invariants**:
+   $$\sum \text{Bid}_i < 1.00 \quad \text{and} \quad \sum \text{Ask}_i > 1.00$$
+   Provides liquidity around normalized fair probabilities while ensuring complete sets cannot be captured against the market maker.
+
+### Running the Neg-Risk Engine
+```bash
+# Single scan across top Polymarket multi-outcome events
+python neg_risk_runner.py --events-limit 25
+
+# Continuous scanning daemon
+python neg_risk_runner.py --loop --interval 15 --min-profit-pct 2.0
+```
+
+---
+
 ## License
 
 MIT License.
