@@ -502,6 +502,17 @@ class NegRiskPaperAccount:
                 }
                 for inv in active_inv
             ],
+            "open_positions": [
+                {
+                    "title": p.event_title,
+                    "slug": p.event_slug,
+                    "cost": p.cost_usdc,
+                    "shares": p.shares,
+                    "expected_profit": p.expected_profit_usdc,
+                    "roi_pct": p.roi_percent,
+                }
+                for p in open_baskets
+            ],
             "open_baskets": [
                 {
                     "title": p.event_title,
