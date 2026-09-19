@@ -92,8 +92,13 @@ class NegRiskScanner:
                     # Incomplete basket! Parity cannot be guaranteed
                     continue
 
+            # Require true Negative Risk multi-outcome structure
+            is_neg_risk = bool(raw.get("negRisk") or any(isinstance(m, dict) and m.get("negRisk") for m in raw_markets))
+            if require_closed_mece and not is_neg_risk:
+                # Skip non-neg-risk multi-threshold ladders where multiple outcomes can resolve YES
+                continue
+
             buckets: list[OutcomeBucket] = []
-            is_neg_risk = bool(raw.get("negRisk") or any(m.get("negRisk") for m in raw_markets if isinstance(m, dict)))
 
             for m in raw_markets:
                 if not isinstance(m, dict):

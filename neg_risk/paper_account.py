@@ -138,11 +138,26 @@ class NegRiskPaperAccount:
         if sum_px <= 0.0:
             return False
 
-        shares = round(budget / sum_px, 4)
-        actual_cost = round(shares * sum_px, 4)
-        expected_payout = round(shares * 1.00, 4)
-        expected_profit = round(expected_payout - actual_cost, 4)
-        roi = round((expected_profit / actual_cost) * 100.0, 2) if actual_cost > 0 else 0.0
+        # Strictly verify positive net profit hurdle
+        if opp.arb_type == "LONG_BASKET_BUY":
+            if sum_px >= 1.00:
+                return False
+            shares = round(budget / sum_px, 4)
+            actual_cost = round(shares * sum_px, 4)
+            expected_payout = round(shares * 1.00, 4)
+            expected_profit = round(expected_payout - actual_cost, 4)
+        else:  # SHORT_BASKET_SELL
+            if sum_px <= 1.00:
+                return False
+            shares = round(budget / 1.00, 4)
+            actual_cost = round(shares * 1.00, 4)  # Maximum liability
+            expected_payout = round(shares * sum_px, 4)  # Premium collected
+            expected_profit = round(expected_payout - actual_cost, 4)
+
+        if expected_profit <= 0.0 or actual_cost <= 0.0:
+            return False
+
+        roi = round((expected_profit / actual_cost) * 100.0, 2)
 
         pos_id = f"arb-{opp.event_slug}-{int(time.time())}"
         legs_data = [
