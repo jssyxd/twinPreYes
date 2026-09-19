@@ -154,26 +154,36 @@ class TestNegRiskStrategies(unittest.TestCase):
         self.assertEqual(report.net_pnl_usdc, Decimal("0"))
 
     def test_market_maker_fills_and_spread_capture(self) -> None:
-        """Test market maker two-sided spread profit capture upon order crossing."""
-        # Our quotes: Fair=0.25, Bid=0.23, Ask=0.27 (Spread=0.04)
-        # Market orderbook crosses: Market Ask=0.22 (Taker hits our bid), Market Bid=0.28 (Taker lifts our ask)
-        books = {
-            "tok_1": BucketBook("tok_1", "<20", Decimal("0.28"), Decimal("0.22"), Decimal("100"), Decimal("50"), fetched_at=self.now),
+        """Test market maker two-sided quoting, bid fills, and ask fills."""
+        # Symmetrical market: Fair=0.25 on each of 4 buckets
+        books_initial = {
+            "tok_1": BucketBook("tok_1", "<20", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
             "tok_2": BucketBook("tok_2", "20-22", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
             "tok_3": BucketBook("tok_3", "22-24", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
             "tok_4": BucketBook("tok_4", ">24", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
         }
         mm = NegRiskMarketMaker(target_spread=Decimal("0.04"), quote_size_usdc=Decimal("5.0"))
-        plan = mm.generate_maker_plan(self.event, books)
+        plan = mm.generate_maker_plan(self.event, books_initial)
 
         self.assertIsNotNone(plan)
         self.assertTrue(plan.is_structurally_safe)
+        # Plan quotes: Bid=0.23, Ask=0.27
 
-        account = NegRiskPaperAccount(initial_capital=200.0, state_file="/tmp/test_mm_state.json", events_file="/tmp/test_mm_events.jsonl")
-        fills = account.process_maker_plan_fills(plan, books)
-        self.assertGreater(fills, 0)
+        account = NegRiskPaperAccount(initial_capital=200.0, state_file="data/test_mm_state.json", events_file="data/test_mm_events.jsonl")
+        # 1. Market order dumps into our Bid at 0.23 (Market best ask drops to 0.23) -> Buy fill!
+        books_bid_hit = dict(books_initial)
+        books_bid_hit["tok_1"] = BucketBook("tok_1", "<20", Decimal("0.21"), Decimal("0.23"), Decimal("100"), Decimal("50"), fetched_at=self.now)
+        fills_buy = account.process_maker_quotes(plan, books_bid_hit)
+        self.assertGreater(fills_buy, 0)
+        self.assertIn("tok_1", account.inventory)
+        self.assertGreater(account.inventory["tok_1"].shares, 0)
+
+        # 2. Market order lifts our Ask at 0.27 (Market best bid rises to 0.28) -> Sell fill & realize profit!
+        books_ask_lift = dict(books_initial)
+        books_ask_lift["tok_1"] = BucketBook("tok_1", "<20", Decimal("0.28"), Decimal("0.30"), Decimal("100"), Decimal("50"), fetched_at=self.now)
+        fills_sell = account.process_maker_quotes(plan, books_ask_lift)
+        self.assertGreater(fills_sell, 0)
         self.assertGreater(account.realized_pnl, 0.0)
-        self.assertGreater(account.cash_balance, 200.0)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,9 @@
 """Unified Orchestrator Engine for Neg-Risk Convexity Arbitrage & Market Making.
 Incorporates Jane Street High-Frequency & Arbitrage Constraints:
 - Per-event pipelined scanning (eliminating batch latency skew)
-- Phantom Arb Filter (latency skew & book staleness)
-- True Hurdle Rate (5% net margin)
-- Bottleneck-First Sequencing
-- Auto-Unwind State Machine
-- Two-Sided Maker Spread Capture Engine
+- Dynamic Arbitrage Hurdle (default 1.5% net guaranteed margin)
+- Bottleneck-First Sequencing & Auto-Unwind
+- Active Two-Sided Maker Spread & Inventory Engine
 """
 from __future__ import annotations
 
@@ -28,9 +26,9 @@ class NegRiskEngine:
     def __init__(
         self,
         *,
-        min_arb_profit_pct: Decimal | float = Decimal("0.05"),  # 5% minimum net hurdle
-        target_maker_spread: Decimal | float = Decimal("0.04"),
-        max_arb_position_usdc: Decimal | float = Decimal("25.0"),
+        min_arb_profit_pct: Decimal | float = Decimal("0.015"),  # 1.5% net profit hurdle
+        target_maker_spread: Decimal | float = Decimal("0.03"),  # 3¢ tight two-sided spread
+        max_arb_position_usdc: Decimal | float = Decimal("20.0"),
         quote_size_usdc: Decimal | float = Decimal("5.0"),
         scanner_timeout: float = 6.0,
         max_book_skew_seconds: float = 0.300,
@@ -83,7 +81,6 @@ class NegRiskEngine:
         # 2. Pipelined execution: Process event-by-event
         for ev in unique_events:
             event_tokens = [b.yes_token_id for b in ev.buckets]
-            t_event_fetch = time.time()
             event_books = self.scanner.fetch_orderbooks(event_tokens)
             total_books_fetched += len(event_books)
 
@@ -105,12 +102,12 @@ class NegRiskEngine:
                         if paper_account.open_arbitrage_basket(opp_short):
                             new_arb_opens += 1
 
-            # Evaluate Maker Plan & Check for Maker Fills
+            # Evaluate Maker Plan & Execute Active Maker Quoting Fills
             plan = self.maker_engine.generate_maker_plan(ev, event_books)
             if plan is not None and plan.is_structurally_safe:
                 maker_plans.append(plan)
                 if paper_account is not None:
-                    fills = paper_account.process_maker_plan_fills(plan, event_books)
+                    fills = paper_account.process_maker_quotes(plan, event_books)
                     new_maker_fills += fills
 
         duration = round(time.time() - started_at, 2)
