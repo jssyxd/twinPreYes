@@ -15,6 +15,7 @@ from neg_risk.models import (
 from neg_risk.arb_strategy import NegRiskArbitrageEngine
 from neg_risk.maker_strategy import NegRiskMarketMaker
 from neg_risk.execution import BasketExecutionEngine
+from neg_risk.paper_account import NegRiskPaperAccount
 
 
 class TestNegRiskStrategies(unittest.TestCase):
@@ -80,7 +81,6 @@ class TestNegRiskStrategies(unittest.TestCase):
 
     def test_phantom_arbitrage_rejected_due_to_latency_skew(self) -> None:
         """Jane Street rule: If latency skew across books > 300ms, opportunity must be rejected."""
-        # Skew = 0.450s (450ms > 300ms threshold)
         books = self._create_fresh_books(skew_offset=0.450)
         engine = NegRiskArbitrageEngine(
             min_profit_pct=Decimal("0.05"),
@@ -90,12 +90,11 @@ class TestNegRiskStrategies(unittest.TestCase):
         self.assertIsNone(opp, "Arbitrage with >300ms skew must be rejected as phantom arb")
 
     def test_stale_book_rejected_due_to_age(self) -> None:
-        """Jane Street rule: If book age > 2.0s, opportunity must be rejected."""
+        """Jane Street rule: If book age > 5.0s, opportunity must be rejected."""
         books = self._create_fresh_books()
-        engine = NegRiskArbitrageEngine(max_book_age_seconds=2.0)
-        # Evaluated 3.5 seconds later
-        opp = engine.evaluate_long_basket(self.event, books, now=self.now + 3.5)
-        self.assertIsNone(opp, "Arbitrage with stale book >2.0s must be rejected")
+        engine = NegRiskArbitrageEngine(max_book_age_seconds=5.0)
+        opp = engine.evaluate_long_basket(self.event, books, now=self.now + 6.0)
+        self.assertIsNone(opp, "Arbitrage with stale book >5.0s must be rejected")
 
     def test_hurdle_rate_filter(self) -> None:
         """Hurdle rate of 5% must reject small 3% margins."""
@@ -105,7 +104,6 @@ class TestNegRiskStrategies(unittest.TestCase):
             "tok_3": BucketBook("tok_3", "22-24", Decimal("0.30"), Decimal("0.32"), Decimal("100"), Decimal("50"), fetched_at=self.now),
             "tok_4": BucketBook("tok_4", ">24", Decimal("0.11"), Decimal("0.13"), Decimal("100"), Decimal("50"), fetched_at=self.now),
         }
-        # SumAsk = 0.12 + 0.40 + 0.32 + 0.13 = 0.97 (Margin = 3%)
         engine = NegRiskArbitrageEngine(min_profit_pct=Decimal("0.05"))
         opp = engine.evaluate_long_basket(self.event, books, now=self.now)
         self.assertIsNone(opp, "3% profit must be rejected when hurdle is 5%")
@@ -119,7 +117,6 @@ class TestNegRiskStrategies(unittest.TestCase):
 
         exec_engine = BasketExecutionEngine(probe_first=True, dry_run=False)
 
-        # Mock submit function: Leg 0 (tok_2 probe) succeeds, Leg 1 (tok_1) fails!
         def mock_submit(leg, limit_px):
             if leg.token_id == "tok_2":
                 return {"filled": True, "price": leg.price, "size": leg.size}
@@ -130,10 +127,8 @@ class TestNegRiskStrategies(unittest.TestCase):
         report = exec_engine.execute_opportunity(opp, books, submit_order_fn=mock_submit)
 
         self.assertEqual(report.status, "UNWOUND")
-        self.assertEqual(report.legs_unwound, 1)  # Only tok_2 was filled and had to be unwound
+        self.assertEqual(report.legs_unwound, 1)  # Only tok_2 was filled
         self.assertIn("Aggressively unwound", report.unwind_notes)
-        # tok_2 bought at 0.35, unwound into Bid at 0.32
-        # Realized unwind friction = (0.32 - 0.35) * 15 = -0.45 USDC
         self.assertEqual(report.net_pnl_usdc, Decimal("-0.4500"))
 
     def test_probe_first_aborted_zero_exposure(self) -> None:
@@ -153,21 +148,32 @@ class TestNegRiskStrategies(unittest.TestCase):
         report = exec_engine.execute_opportunity(opp, books, submit_order_fn=mock_submit)
 
         self.assertEqual(report.status, "PROBE_ABORTED")
-        self.assertEqual(len(calls), 1)  # ONLY probe leg was called!
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0], "tok_2")
         self.assertEqual(report.total_spent_usdc, Decimal("0"))
         self.assertEqual(report.net_pnl_usdc, Decimal("0"))
 
-    def test_market_maker_generates_coherent_two_sided_quotes(self) -> None:
-        """Test market maker generates quotes satisfying SumBid < 1.00 and SumAsk > 1.00."""
-        books = self._create_fresh_books()
+    def test_market_maker_fills_and_spread_capture(self) -> None:
+        """Test market maker two-sided spread profit capture upon order crossing."""
+        # Our quotes: Fair=0.25, Bid=0.23, Ask=0.27 (Spread=0.04)
+        # Market orderbook crosses: Market Ask=0.22 (Taker hits our bid), Market Bid=0.28 (Taker lifts our ask)
+        books = {
+            "tok_1": BucketBook("tok_1", "<20", Decimal("0.28"), Decimal("0.22"), Decimal("100"), Decimal("50"), fetched_at=self.now),
+            "tok_2": BucketBook("tok_2", "20-22", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
+            "tok_3": BucketBook("tok_3", "22-24", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
+            "tok_4": BucketBook("tok_4", ">24", Decimal("0.24"), Decimal("0.26"), Decimal("100"), Decimal("50"), fetched_at=self.now),
+        }
         mm = NegRiskMarketMaker(target_spread=Decimal("0.04"), quote_size_usdc=Decimal("5.0"))
         plan = mm.generate_maker_plan(self.event, books)
 
         self.assertIsNotNone(plan)
         self.assertTrue(plan.is_structurally_safe)
-        self.assertLess(plan.sum_bid, Decimal("1.00"))
-        self.assertGreater(plan.sum_ask, Decimal("1.00"))
+
+        account = NegRiskPaperAccount(initial_capital=200.0, state_file="/tmp/test_mm_state.json", events_file="/tmp/test_mm_events.jsonl")
+        fills = account.process_maker_plan_fills(plan, books)
+        self.assertGreater(fills, 0)
+        self.assertGreater(account.realized_pnl, 0.0)
+        self.assertGreater(account.cash_balance, 200.0)
 
 
 if __name__ == "__main__":

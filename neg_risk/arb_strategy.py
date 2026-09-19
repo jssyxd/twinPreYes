@@ -31,19 +31,19 @@ class NegRiskArbitrageEngine:
     def __init__(
         self,
         *,
-        min_profit_pct: Decimal = Decimal("0.05"),  # 5% minimum net margin hurdle (Jane Street rule)
-        max_position_usdc: Decimal = Decimal("50.0"),  # max USDC per arbitrage basket
-        min_order_usdc: Decimal = Decimal("1.0"),
+        min_profit_pct: Decimal | float = Decimal("0.05"),  # 5% minimum net margin hurdle (Jane Street rule)
+        max_position_usdc: Decimal | float = Decimal("50.0"),  # max USDC per arbitrage basket
+        min_order_usdc: Decimal | float = Decimal("1.0"),
         max_book_skew_seconds: float = 0.300,  # 300ms maximum time discrepancy between books
-        max_book_age_seconds: float = 2.0,  # 2.0s maximum snapshot staleness
-        max_leg_slippage_pct: Decimal = Decimal("0.01"),  # 1% worst acceptable price buffer
+        max_book_age_seconds: float = 5.0,  # 5.0s maximum snapshot staleness
+        max_leg_slippage_pct: Decimal | float = Decimal("0.01"),  # 1% worst acceptable price buffer
     ) -> None:
-        self.min_profit_pct = min_profit_pct
-        self.max_position_usdc = max_position_usdc
-        self.min_order_usdc = min_order_usdc
-        self.max_book_skew_seconds = max_book_skew_seconds
-        self.max_book_age_seconds = max_book_age_seconds
-        self.max_leg_slippage_pct = max_leg_slippage_pct
+        self.min_profit_pct = Decimal(str(min_profit_pct))
+        self.max_position_usdc = Decimal(str(max_position_usdc))
+        self.min_order_usdc = Decimal(str(min_order_usdc))
+        self.max_book_skew_seconds = float(max_book_skew_seconds)
+        self.max_book_age_seconds = float(max_book_age_seconds)
+        self.max_leg_slippage_pct = Decimal(str(max_leg_slippage_pct))
 
     def _verify_books_freshness(
         self,

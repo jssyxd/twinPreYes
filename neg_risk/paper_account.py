@@ -3,6 +3,10 @@
 Features:
 - Initial Capital: 200.0 USDC (configurable)
 - Per-Basket Budget: 20.0 USDC (configurable)
+- Arbitrage Execution: Buys entire MECE Yes complete-set basket at SumAsk < 1.00.
+- Maker Two-Sided Paper Fill Engine:
+  Simulates passive fills when market orderbook best bid/ask crosses our quoted Maker spread.
+  Captures bid-ask spread profits + records maker volume.
 - Complete Set Settlement: When any event resolves on Polymarket, credits 1.00 * shares to cash.
 - Persistent JSON State: Atomic saves to state file and events log.
 """
@@ -18,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from neg_risk.models import BasketArbOpportunity
+from neg_risk.models import BasketArbOpportunity, BucketBook, MakerPlan
 
 logger = logging.getLogger("twinPreYes.neg_risk.paper")
 GAMMA_EVENT_ENDPOINT = "https://gamma-api.polymarket.com/events/slug/"
@@ -29,7 +33,7 @@ class PaperBasketPosition:
     position_id: str
     event_slug: str
     event_title: str
-    arb_type: str
+    strategy_type: str  # "ARBITRAGE" or "MAKER_TWO_SIDED"
     cost_usdc: float
     shares: float
     sum_price: float
@@ -38,7 +42,7 @@ class PaperBasketPosition:
     roi_percent: float
     legs: list[dict[str, Any]]
     opened_at_epoch: float
-    status: str = "OPEN"  # OPEN, WON_SETTLED, UNWOUND
+    status: str = "OPEN"  # OPEN, WON_SETTLED, UNWOUND, CLOSED
     realized_pnl: float = 0.0
     settled_at_epoch: float | None = None
     winning_token_id: str | None = None
@@ -61,6 +65,8 @@ class NegRiskPaperAccount:
         self.cash_balance = initial_capital
         self.realized_pnl = 0.0
         self.total_trades = 0
+        self.maker_trades = 0
+        self.arb_trades = 0
         self.positions: dict[str, PaperBasketPosition] = {}
 
         os.makedirs(os.path.dirname(os.path.abspath(self.state_file)), exist_ok=True)
@@ -77,6 +83,8 @@ class NegRiskPaperAccount:
             self.cash_balance = float(data.get("cash_balance", self.initial_capital))
             self.realized_pnl = float(data.get("realized_pnl", 0.0))
             self.total_trades = int(data.get("total_trades", 0))
+            self.maker_trades = int(data.get("maker_trades", 0))
+            self.arb_trades = int(data.get("arb_trades", 0))
             raw_pos = data.get("positions", {})
             self.positions = {}
             for pid, pdata in raw_pos.items():
@@ -90,6 +98,8 @@ class NegRiskPaperAccount:
             "cash_balance": round(self.cash_balance, 4),
             "realized_pnl": round(self.realized_pnl, 4),
             "total_trades": self.total_trades,
+            "maker_trades": self.maker_trades,
+            "arb_trades": self.arb_trades,
             "open_positions_count": sum(1 for p in self.positions.values() if p.status == "OPEN"),
             "open_cost_usdc": round(sum(p.cost_usdc for p in self.positions.values() if p.status == "OPEN"), 4),
             "total_equity_usdc": round(
@@ -98,7 +108,6 @@ class NegRiskPaperAccount:
             "positions": {pid: asdict(p) for pid, p in self.positions.items()},
             "updated_at": time.time(),
         }
-        # Atomic write
         dirname = os.path.dirname(os.path.abspath(self.state_file))
         fd, tmp = tempfile.mkstemp(dir=dirname, prefix="negrisk_state_", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -117,16 +126,13 @@ class NegRiskPaperAccount:
 
     def open_arbitrage_basket(self, opp: BasketArbOpportunity) -> bool:
         """Open a paper basket arbitrage position within budget."""
-        # Check duplicate open on same event
         for p in self.positions.values():
             if p.event_slug == opp.event_slug and p.status == "OPEN":
                 return False
 
         if self.cash_balance < 5.0:
-            logger.warning(f"Insufficient cash ({self.cash_balance} < 5.0) to open basket.")
             return False
 
-        # Scale position to budget_per_order
         budget = min(float(self.budget_per_order), self.cash_balance)
         sum_px = float(opp.sum_price)
         if sum_px <= 0.0:
@@ -138,7 +144,7 @@ class NegRiskPaperAccount:
         expected_profit = round(expected_payout - actual_cost, 4)
         roi = round((expected_profit / actual_cost) * 100.0, 2) if actual_cost > 0 else 0.0
 
-        pos_id = f"pos-{opp.event_slug}-{int(time.time())}"
+        pos_id = f"arb-{opp.event_slug}-{int(time.time())}"
         legs_data = [
             {
                 "token_id": leg.token_id,
@@ -156,7 +162,7 @@ class NegRiskPaperAccount:
             position_id=pos_id,
             event_slug=opp.event_slug,
             event_title=opp.title,
-            arb_type=opp.arb_type,
+            strategy_type="ARBITRAGE",
             cost_usdc=actual_cost,
             shares=shares,
             sum_price=sum_px,
@@ -170,6 +176,7 @@ class NegRiskPaperAccount:
 
         self.cash_balance -= actual_cost
         self.total_trades += 1
+        self.arb_trades += 1
         self.positions[pos_id] = pos
         self.save_state()
 
@@ -191,6 +198,69 @@ class NegRiskPaperAccount:
         )
         return True
 
+    def process_maker_plan_fills(
+        self,
+        plan: MakerPlan,
+        books: dict[str, BucketBook],
+    ) -> int:
+        """Process passive Maker fills when external market crossing matches our quoted bids/asks.
+        
+        If a market order crosses our quote:
+        - We buy Yes at Bid (< Fair) or sell Yes at Ask (> Fair).
+        - If both sides of our quote or complete sets are filled across quotes, captures round-trip spread profit.
+        """
+        if not plan.is_structurally_safe or self.cash_balance < 5.0:
+            return 0
+
+        # Check existing active maker position on this event
+        existing_pos_id = f"maker-{plan.event_slug}"
+        pos = self.positions.get(existing_pos_id)
+
+        fills_count = 0
+        now = time.time()
+
+        for q in plan.quotes:
+            book = books.get(q.token_id)
+            if not book:
+                continue
+
+            # Check if market best_ask <= our bid_price (Market Takers selling into our bid)
+            bid_hit = (book.best_ask is not None and book.best_ask <= q.bid_price)
+            # Check if market best_bid >= our ask_price (Market Takers buying from our ask)
+            ask_lift = (book.best_bid is not None and book.best_bid >= q.ask_price)
+
+            if bid_hit and ask_lift:
+                # Two-way round-trip capture! Pure bid-ask spread profit
+                traded_shares = min(float(q.bid_size), float(q.ask_size), 50.0)
+                spread_captured = float(q.spread) * traded_shares
+                profit = round(spread_captured, 4)
+
+                self.cash_balance += profit
+                self.realized_pnl += profit
+                self.total_trades += 1
+                self.maker_trades += 1
+                fills_count += 1
+
+                self.log_event("paper_maker_roundtrip_fill", {
+                    "event_slug": plan.event_slug,
+                    "title": plan.title,
+                    "token_id": q.token_id,
+                    "label": q.label,
+                    "bid_price": float(q.bid_price),
+                    "ask_price": float(q.ask_price),
+                    "shares": traded_shares,
+                    "spread_profit_usdc": profit,
+                    "cash_balance": round(self.cash_balance, 4),
+                })
+                logger.info(
+                    f"💰 [MAKER SPREAD FILL] {plan.title} [{q.label}] | Traded: {traded_shares} sh @ "
+                    f"[{q.bid_price}/{q.ask_price}] | Captured Spread Profit: +{profit} USDC | Cash: {round(self.cash_balance, 2)}U"
+                )
+
+        if fills_count > 0:
+            self.save_state()
+        return fills_count
+
     def check_and_settle_events(self) -> int:
         """Poll Gamma resolution status for open positions and settle complete sets."""
         settled_count = 0
@@ -200,7 +270,6 @@ class NegRiskPaperAccount:
             if pos.status != "OPEN":
                 continue
 
-            # Check resolution from Gamma API
             url = f"{GAMMA_EVENT_ENDPOINT}{pos.event_slug}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "twinPreYes-Settler/1.0"})
@@ -215,7 +284,6 @@ class NegRiskPaperAccount:
             markets = event_data.get("markets") or []
             is_closed = event_data.get("closed") or all(m.get("closed") for m in markets if isinstance(m, dict))
 
-            # Look for 1.0 resolution in any market
             resolved_token = None
             for m in markets:
                 if not isinstance(m, dict):
@@ -230,7 +298,6 @@ class NegRiskPaperAccount:
                     continue
 
             if is_closed or resolved_token:
-                # Event resolved! Complete set pays out exactly 1.00 per share
                 payout = pos.expected_payout_usdc
                 profit = payout - pos.cost_usdc
                 pos.status = "WON_SETTLED"
@@ -273,6 +340,8 @@ class NegRiskPaperAccount:
             "total_equity_usdc": round(total_equity, 4),
             "realized_pnl_usdc": round(self.realized_pnl, 4),
             "total_trades": self.total_trades,
+            "maker_trades": self.maker_trades,
+            "arb_trades": self.arb_trades,
             "open_positions": [
                 {
                     "title": p.event_title,

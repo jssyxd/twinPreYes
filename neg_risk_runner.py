@@ -2,10 +2,13 @@
 """CLI daemon runner for Neg-Risk Convexity Arbitrage & Market Making Engine.
 
 Features:
+- Pipelined Event-by-Event Scan: Eliminates batch delay skew (<0.3s per event)
 - Mode: Paper (default, 200.0 USDC initial, 20.0 USDC/basket) or Live
+- Dual-Track Execution:
+  1. Arbitrage Track: Complete-set Long/Short parity arbitrage
+  2. Maker Track: Two-sided quoting, spread profit capture & volume attribution
 - Guards: Jane Street-grade latency skew check (<300ms) + 5% profit hurdle
-- Auto Paper Execution: opens guaranteed complete-set arbitrage baskets
-- Auto Settlement: polls resolution and settles complete sets to cash
+- Auto Settlement: polls Gamma resolution and credits complete sets to cash
 - Health state: writes data/negrisk_health.json
 """
 from __future__ import annotations
@@ -32,14 +35,14 @@ logger = logging.getLogger("negrisk_runner")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Polymarket Neg-Risk Arbitrage & Maker Engine")
+    parser = argparse.ArgumentParser(description="Polymarket Neg-Risk Arbitrage & Maker Engine (Pipelined & Hardened)")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper", help="Execution mode (default: paper)")
     parser.add_argument("--initial-capital", type=float, default=200.0, help="Paper initial capital (default: 200.0 USDC)")
     parser.add_argument("--budget", type=float, default=20.0, help="Per-basket budget in USDC (default: 20.0 USDC)")
-    parser.add_argument("--interval", type=int, default=20, help="Scan interval in seconds (default: 20s)")
-    parser.add_argument("--min-profit-pct", type=float, default=5.0, help="Min arb net profit pct hurdle (default: 5.0 pct)")
+    parser.add_argument("--interval", type=int, default=15, help="Scan interval in seconds (default: 15s)")
+    parser.add_argument("--min-profit-pct", type=float, default=5.0, help="Min arb net profit % hurdle (default: 5.0%)")
     parser.add_argument("--target-spread", type=float, default=0.04, help="Target maker spread in cents (default: 0.04)")
-    parser.add_argument("--events-limit", type=int, default=30, help="Number of Gamma events to scan (default: 30)")
+    parser.add_argument("--events-limit", type=int, default=25, help="Number of Gamma events to scan (default: 25)")
     parser.add_argument("--max-skew-ms", type=float, default=300.0, help="Max latency skew across books (default: 300ms)")
     parser.add_argument("--state-file", default="data/negrisk_state.json", help="Path to state file")
     parser.add_argument("--events-file", default="data/negrisk_events.jsonl", help="Path to events JSONL log")
@@ -66,6 +69,7 @@ def main() -> None:
     engine = NegRiskEngine(
         min_arb_profit_pct=Decimal(str(args.min_profit_pct / 100.0)),
         target_maker_spread=Decimal(str(args.target_spread)),
+        max_arb_position_usdc=Decimal(str(args.budget)),
         max_book_skew_seconds=args.max_skew_ms / 1000.0,
         probe_first=True,
         dry_run=(args.mode == "paper"),
@@ -74,7 +78,7 @@ def main() -> None:
     logger.info(f"=== Polymarket Neg-Risk Engine [{args.mode.upper()}] Initialized ===")
     logger.info(
         f"Config: Initial={args.initial_capital}U, Budget/Order={args.budget}U, "
-        f"Hurdle={args.min_profit_pct}%, MaxSkew={args.max_skew_ms}ms, Interval={args.interval}s"
+        f"Hurdle={args.min_profit_pct}%, MaxSkew={args.max_skew_ms}ms, Pipelined=True"
     )
     logger.info(f"Current Cash: {paper_account.cash_balance} USDC | Equity: {paper_account.get_summary()['total_equity_usdc']} USDC")
 
@@ -88,23 +92,21 @@ def main() -> None:
             if settled > 0:
                 logger.info(f"Cycle {cycle_count}: Settled {settled} completed event basket(s).")
 
-            # 2. Scan market opportunities
-            result = engine.scan_and_evaluate(gamma_events_limit=args.events_limit)
+            # 2. Pipelined event-by-event scan, arb evaluation & maker execution
+            result = engine.scan_and_evaluate_pipelined(
+                gamma_events_limit=args.events_limit,
+                paper_account=(paper_account if args.mode == "paper" else None),
+            )
+
             duration = result["scan_duration_seconds"]
             arbs = result["arb_opportunities"]
             makers = result["maker_plans"]
-
-            # 3. If paper mode and opportunities exist, open baskets
-            new_opens = 0
-            if args.mode == "paper" and arbs:
-                for opp in arbs:
-                    opened = paper_account.open_arbitrage_basket(opp)
-                    if opened:
-                        new_opens += 1
+            new_arb_opens = result["new_arb_opens"]
+            new_maker_fills = result["new_maker_fills"]
 
             summary = paper_account.get_summary()
 
-            # 4. Write health status
+            # 3. Write atomic health status
             health_data = {
                 "status": "healthy",
                 "mode": args.mode,
@@ -113,14 +115,19 @@ def main() -> None:
                 "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "scan_duration_seconds": duration,
                 "events_scanned": result["events_scanned"],
+                "orderbooks_fetched": result["orderbooks_fetched"],
                 "arb_opportunities_found": len(arbs),
                 "maker_plans_found": len(makers),
+                "new_arb_opens": new_arb_opens,
+                "new_maker_fills": new_maker_fills,
                 "cash_balance_usdc": summary["cash_balance"],
                 "open_positions_count": summary["open_positions_count"],
                 "open_cost_usdc": summary["open_cost_usdc"],
                 "total_equity_usdc": summary["total_equity_usdc"],
                 "realized_pnl_usdc": summary["realized_pnl_usdc"],
                 "total_trades": summary["total_trades"],
+                "maker_trades": summary["maker_trades"],
+                "arb_trades": summary["arb_trades"],
                 "open_positions": summary["open_positions"],
             }
             os.makedirs(os.path.dirname(os.path.abspath(args.health_file)), exist_ok=True)
@@ -132,8 +139,8 @@ def main() -> None:
 
             # Log periodic status
             logger.info(
-                f"Cycle {cycle_count}: Scanned {result['events_scanned']} events in {duration}s | "
-                f"Arb: {len(arbs)} (NewOpens={new_opens}) | MakerPlans: {len(makers)} | "
+                f"Cycle {cycle_count}: Scanned {result['events_scanned']} events ({result['orderbooks_fetched']} books) in {duration}s | "
+                f"Arb: {len(arbs)} (NewOpens={new_arb_opens}) | MakerPlans: {len(makers)} (Fills={new_maker_fills}) | "
                 f"Cash={summary['cash_balance']}U | Equity={summary['total_equity_usdc']}U | PnL={summary['realized_pnl_usdc']}U"
             )
 
@@ -142,7 +149,6 @@ def main() -> None:
 
         elapsed = time.time() - started_at
         sleep_time = max(1.0, args.interval - elapsed)
-        # Sleep in short increments to respond to signals promptly
         for _ in range(int(sleep_time * 2)):
             if stop_flag:
                 break

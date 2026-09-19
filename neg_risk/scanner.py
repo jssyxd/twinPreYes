@@ -24,7 +24,7 @@ class NegRiskScanner:
         self,
         *,
         timeout_seconds: float = 6.0,
-        max_workers: int = 10,
+        max_workers: int = 15,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_workers = max_workers
@@ -43,8 +43,14 @@ class NegRiskScanner:
         *,
         tags: list[str] | None = None,
         limit: int = 50,
+        require_closed_mece: bool = True,
     ) -> list[EventMarket]:
-        """Fetch active multi-outcome markets from Polymarket Gamma API."""
+        """Fetch active multi-outcome markets from Polymarket Gamma API.
+        
+        If require_closed_mece is True, validates that all candidate markets within
+        the event are open and active, filtering out events where crucial outcomes
+        (e.g., 'Other') are inactive, which would break the guaranteed parity basket.
+        """
         params = {
             "closed": "false",
             "active": "true",
@@ -57,7 +63,7 @@ class NegRiskScanner:
         url = f"{GAMMA_EVENTS_ENDPOINT}?{urllib.parse.urlencode(params)}"
         try:
             raw_events = self._fetch_json(url)
-        except Exception as exc:
+        except Exception:
             return []
 
         if not isinstance(raw_events, list):
@@ -73,6 +79,18 @@ class NegRiskScanner:
             raw_markets = raw.get("markets") or []
             if not isinstance(raw_markets, list) or len(raw_markets) < 2:
                 continue
+
+            # Invariant check: if require_closed_mece is enabled, ensure no market is disabled/closed
+            # that represents a valid candidate outcome (especially 'Other')
+            if require_closed_mece:
+                has_inactive_other = any(
+                    isinstance(m, dict) and ('Other' in str(m.get('groupItemTitle', '')) or 'Other' in str(m.get('question', '')))
+                    and (m.get('active') is False or m.get('closed') is True)
+                    for m in raw_markets
+                )
+                if has_inactive_other:
+                    # Incomplete basket! Parity cannot be guaranteed
+                    continue
 
             buckets: list[OutcomeBucket] = []
             is_neg_risk = bool(raw.get("negRisk") or any(m.get("negRisk") for m in raw_markets if isinstance(m, dict)))
@@ -103,7 +121,6 @@ class NegRiskScanner:
                     elif outcome_name == "No":
                         no_token = str(tok)
 
-                # For binary/multi-outcome representations where outcome name is the label itself
                 if not yes_token and len(token_ids) >= 1:
                     yes_token = str(token_ids[0])
                     if len(token_ids) > 1:
@@ -181,11 +198,11 @@ class NegRiskScanner:
             return {}
 
         results: dict[str, BucketBook] = {}
-        now = time.time()
 
         def fetch_single(tok: str) -> tuple[str, BucketBook | None]:
             url = f"{BOOK_ENDPOINT}?{urllib.parse.urlencode({'token_id': tok})}"
             try:
+                t_fetch = time.time()
                 data = self._fetch_json(url)
                 if not isinstance(data, dict):
                     return tok, None
@@ -218,7 +235,7 @@ class NegRiskScanner:
                     ask_size=ask_size,
                     bids=bids,
                     asks=asks,
-                    fetched_at=now,
+                    fetched_at=t_fetch,
                 )
                 return tok, book
             except Exception:
